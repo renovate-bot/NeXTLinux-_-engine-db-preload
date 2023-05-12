@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+
+# Fail on any errors, including in pipelines
+# Don't allow unset variables. Trace all functions with DEBUG trap
+set -eo pipefail -o functrace
+
+display_usage() {
+    echo "${color_yellow}"
+    cat << EOF
+    Nextlinux Build Pipeline ---
+
+    CI pipeline script for Nextlinux container images.
+    Allows building container images & mocking CI pipelines.
+
+    The following overide environment variables are available:
+        
+        SKIP_CLEANUP = [ true | false ] - skips cleanup job that runs on exit (kills containers & removes workspace)
+        IMAGE_REPO = docker.io/example/test - specify a custom image repo to build/test
+        WORKING_DIRECTORY = /home/test/workdir - used as a temporary workspace for build/test
+        WORKSPACE = /home/test/workspace - used to store temporary artifacts
+
+    Usage: ${0##*/} [ -f | -s ] [ build | test | ci | function_name ]  < build_version >
+        
+        f - Force sync from a fresh postgresql image
+        s - Build slim preloaded image without nvd2 feed data
+        build - Build a dev image tagged IMAGE_REPO:dev'
+        test - Run full ci pipeline locally on your workstation
+        ci - Run mocked CircleCI pipeline using Docker-in-Docker
+        function_name - Invoke a function directly using build environment
+EOF
+    echo "${color_normal}"
+}
+
+##############################################
+###   PROJECT SPECIFIC ENVIRONMENT SETUP   ###
+##############################################
+
+# Specify what versions to build & what version should get 'latest' tag
+export BUILD_VERSIONS=('v0.10.2' 'v0.10.1' 'v0.10.0' 'v0.9.4')
+export LATEST_VERSION='v0.10.2'
+
+# PROJECT_VARS are custom vars that are modified between projects
+# Expand all required ENV vars or set to default values with := variable substitution
+# Use eval on $CIRCLE_WORKING_DIRECTORY to ensure default value (~/project) gets expanded to the absolute path
+export PROJECT_VARS=( \
+    "IMAGE_REPO=${IMAGE_REPO:=nextlinux/engine-db-preload}" \
+    "PROJECT_REPONAME=${CIRCLE_PROJECT_REPONAME:=engine-db-preload}" \
+    "WORKING_DIRECTORY=${WORKING_DIRECTORY:=$(eval echo ${CIRCLE_WORKING_DIRECTORY:="${HOME}/tempci_${IMAGE_REPO##*/}_${RANDOM}/project"})}" \
+    "WORKSPACE=${WORKSPACE:=$(dirname "$WORKING_DIRECTORY")/workspace}" \
+)
+# These vars are static & defaults should not need to be changed
+PROJECT_VARS+=( \
+    "CI=${CI:=false}" \
+    "GIT_BRANCH=${CIRCLE_BRANCH:=dev}" \
+    "SKIP_FINAL_CLEANUP=${SKIP_FINAL_CLEANUP:=false}" \
+)
+
+
+########################################
+###   MAIN PROGRAM BOOTSTRAP LOGIC   ###
+########################################
+
+main() {
+    if [[ "$#" -eq 0 ]]; then
+        echo "ERROR - $0 requires at least 1 input" >&2
+        display_usage >&2
+        exit 1
+    fi
+
+    while getopts ':fsh' option; do
+        case "${option}" in
+            f  ) f_flag=true;;
+            s  ) s_flag=true;;
+            h  ) display_usage; exit;;
+            \? ) printf "\n\t%s\n\n" "Invalid option: -${OPTARG}" >&2; display_usage >&2; exit 1;;
+            :  ) printf "\n\t%s\n\n%s\n\n" "Option -${OPTARG} requires an argument." >&2; display_usage >&2; exit 1;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+
+    PROJECT_VARS+=( \
+        "FORCE_FRESH_SYNC=${f_flag:=false}" \
+        "SLIM_BUILD=${s_flag:=false}" \
+    )
+
+    # Save current working directory for cleanup on exit
+    pushd . &> /dev/null
+
+    # Trap all signals that cause script to exit & run cleanup function before exiting
+    trap 'cleanup' SIGINT SIGTERM ERR EXIT
+    trap 'printf "\n%s+ PIPELINE ERROR - exit code %s - cleaning up %s\n" "${color_red}" "$?" "${color_normal}"' SIGINT SIGTERM ERR
+
+    # Get ci_utils.sh from Nextlinux test-infra repo - used for common functions
+    # If running on test-infra container ci_utils.sh is installed to /usr/local/bin/
+    # if [[ -f /usr/local/bin/ci_utils.sh ]]; then
+    #     source ci_utils.sh
+    # elif [[ -f "${WORKSPACE}/test-infra/scripts/ci_utils.sh" ]]; then
+    #     source "${WORKSPACE}/test-infra/scripts/ci_utils.sh"
+    # else
+    #     git clone https://github.com/Nextlinux/test-infra "${WORKSPACE}/test-infra"
+    #     source "${WORKSPACE}/test-infra/scripts/ci_utils.sh"
+    # fi
+
+    # Setup terminal colors for printing
+    export TERM=xterm
+    color_red=$(tput setaf 1)
+    color_cyan=$(tput setaf 6)
+    color_yellow=$(tput setaf 3)
+    color_normal=$(tput setaf 9)
+
+    setup_and_print_env_vars
+
+    # Trap all bash commands & print to screen. Like using set -v but allows printing in color
+    trap 'printf "%s+ %s%s\n" "${color_cyan}" "$BASH_COMMAND" "${color_normal}" >&2' DEBUG
+
+    # Run script with the 'build' param to build the image, include additional version param (eg 'all', 'v0.5.0', 'dev'). Defaults to 'latest'
+    if [[ "$1" == 'build' ]]; then
+        build_images "${2:-latest}"
+    # Run script with the 'test' param to execute the full pipeline locally, builds specified version
+    elif [[ "$1" == 'test' ]]; then
+        build_images "${2:-dev}"
+        save_images "${2:-dev}"
+        test_built_images "${2:-dev}"
+        push_all_versions "${2:-dev}"
+    # Run script with the 'ci' param to execute a fully mocked CircleCI pipeline, running in docker
+    elif [[ "$1" == 'ci' ]]; then
+        setup_build_environment
+        ci_test_job 'docker.io/nextlinux/test-infra:latest' 'build_images'
+        ci_test_job 'docker.io/nextlinux/test-infra:latest' 'save_images'
+        ci_test_job 'docker.io/nextlinux/test-infra:latest' 'test_built_images'
+        ci_test_job 'docker.io/nextlinux/test-infra:latest' 'push_all_versions'
+    else
+        export SKIP_FINAL_CLEANUP=true
+        # If first param is a valid function name, execute the function & pass all following params to function
+        if declare -f "$1" > /dev/null; then
+            "$@"
+        else
+            display_usage >&2
+            printf "%sERROR - %s is not a valid function name %s\n" "${color_red}" "$1" "${color_normal}" >&2
+            exit 1
+        fi
+    fi
+}
+
+# The cleanup() function that runs whenever the script exits
+cleanup() {
+    ret="$?"
+    set +euo pipefail
+    if [[ "${ret}" -eq 0 ]]; then
+        set +o functrace
+    fi
+    if [[ "${SKIP_FINAL_CLEANUP}" == false ]]; then
+        deactivate 2> /dev/null
+        docker-compose down --volumes 2> /dev/null
+        if [[ "${DOCKER_RUN_IDS[@]}" -ne 0 ]]; then
+            for i in "${DOCKER_RUN_IDS[@]}"; do
+                docker kill "$i" 2> /dev/null
+                docker rm "$i" 2> /dev/null
+            done
+        fi
+        popd &> /dev/null
+        if [[ "${WORKING_DIRECTORY}" =~ 'tempci' ]]; then
+            rm -rf $(dirname "${WORKING_DIRECTORY}")
+        fi
+    else
+        echo "Workspace dir: ${WORKSPACE}"
+        echo "Working Dir: ${WORKING_DIRECTORY}"
+    fi
+    popd &> /dev/null
+    exit "${ret}"
+}
+
+
+#################################################################
+###   FUNCTIONS CALLED DIRECTLY BY CIRCLECI - RUNTIME ORDER   ###
+#################################################################
+
+build_images() {
+    local build_version="$1"
+
+    if [[ "${SLIM_BUILD}" == 'true' ]]; then
+        local feed_sync_opts="--slim"
+    fi
+
+    if [[ "${build_version}" == 'all' ]]; then
+        for version in "${BUILD_VERSIONS[@]}"; do
+            setup_build_environment "${version}"
+            compose_up_nextlinux_engine "${version}"
+            scripts/feed_sync_wait.py ${feed_sync_opts} 300 60
+            # If incrementals fail after 120 minutes, run a full sync
+            #
+            # if ! scripts/feed_sync_wait.py ${feed_sync_opts} 120 60; then
+            #     compose_down_nextlinux_engine
+            #     export COMPOSE_DB_IMAGE="postgres:9"
+            #     compose_up_nextlinux_engine "${version}"
+            #     scripts/feed_sync_wait.py ${feed_sync_opts} 300 60
+            # fi
+            compose_down_nextlinux_engine
+            docker build -t "${IMAGE_REPO}:dev" .
+            docker tag "${IMAGE_REPO}:dev" "${IMAGE_REPO}:dev-${version}"
+        done 
+    else
+        setup_build_environment "${build_version}"
+        compose_up_nextlinux_engine "${build_version}"
+        scripts/feed_sync_wait.py ${feed_sync_opts} 300 60
+        # If incrementals fail after 120 minutes, run a full sync
+        #
+        # if [[ "${FORCE_FRESH_SYNC}" == 'true' ]]; then
+        #     scripts/feed_sync_wait.py ${feed_sync_opts} 300 60
+        # else
+        #     if ! scripts/feed_sync_wait.py ${feed_sync_opts} 120 60; then
+        #         compose_down_nextlinux_engine
+        #         export COMPOSE_DB_IMAGE="postgres:9"
+        #         compose_up_nextlinux_engine "${build_version}"
+        #         scripts/feed_sync_wait.py ${feed_sync_opts} 300 60
+        #     fi
+        # fi
+        compose_down_nextlinux_engine
+        docker build -t "${IMAGE_REPO}:dev" .
+        docker tag "${IMAGE_REPO}:dev" "${IMAGE_REPO}:dev-${build_version}"
+    fi
+}
+
+save_images() {
+    local build_version="$1"
+    if [[ "${build_version}" == 'all' ]]; then
+        for version in "${BUILD_VERSIONS[@]}"; do
+            setup_build_environment "${version}"
+            save_image "${version}"
+        done
+    else
+        setup_build_environment "${build_version}"
+        save_image "${build_version}"
+    fi
+}
+
+test_built_images() {
+    local build_version="$1"
+    if [[ "${build_version}" == 'all' ]]; then
+        for version in "${BUILD_VERSIONS[@]}"; do
+            setup_build_environment "${version}"
+            load_image "${version}"
+            export COMPOSE_DB_IMAGE=$(eval echo "${IMAGE_REPO}:dev-${version}")
+            compose_up_nextlinux_engine "${version}"
+            run_tests
+            compose_down_nextlinux_engine
+        done
+    else
+        setup_build_environment "${build_version}"
+        load_image "${build_version}"
+        export COMPOSE_DB_IMAGE=$(eval echo "${IMAGE_REPO}:dev-${build_version}")
+        compose_up_nextlinux_engine "${build_version}"
+        run_tests
+        compose_down_nextlinux_engine
+    fi
+}
+
+push_all_versions() {
+    local build_version="$1"
+    if [[ "${build_version}" == 'all' ]]; then
+        for version in "${BUILD_VERSIONS[@]}"; do
+            setup_build_environment "${version}"
+            load_image "${version}"
+            push_dockerhub "${version}"
+        done
+    else
+        setup_build_environment "${build_version}"
+        load_image "${build_version}"
+        push_dockerhub "${build_version}"
+    fi
+}
+
+
+###########################################################
+###   PROJECT SPECIFIC FUNCTIONS - ALPHABETICAL ORDER   ###
+###########################################################
+
+compose_down_nextlinux_engine() {
+    docker-compose down --volumes
+    unset COMPOSE_DB_IMAGE COMPOSE_ENGINE_IMAGE
+    # For machine image on circleci no need to ssh to remote-docker
+    rm -rf "${WORKSPACE}/aevolume" || sudo rm -rf "${WORKSPACE}/aevolume"
+    # If running on circleCI kill forwarded socket to remote-docker
+    # if [[ "${CI}" == true ]]; then
+    #     ssh -S nextlinux -O exit remote-docker
+    #     ssh remote-docker "sudo rm -rf ${WORKSPACE}/aevolume"
+    # else
+    #     rm -rf "${WORKSPACE}/aevolume"
+    # fi
+}
+
+compose_up_nextlinux_engine() {
+    local nextlinux_version="$1"
+
+    # set default values using := notation if COMPOSE vars aren't already set
+    if [[ "${nextlinux_version}" == "dev" ]]; then
+        export COMPOSE_ENGINE_IMAGE=${COMPOSE_ENGINE_IMAGE:="docker.io/nextlinux/nextlinux-engine-dev:latest"}
+    elif [[ "${nextlinux_version}" == "issue-712" ]]; then
+        export COMPOSE_ENGINE_IMAGE=${COMPOSE_ENGINE_IMAGE:="docker.io/nextlinux/nextlinux-engine-dev:issue-712"}
+    else
+        export COMPOSE_ENGINE_IMAGE=${COMPOSE_ENGINE_IMAGE:=$(eval echo "docker.io/nextlinux/nextlinux-engine:${nextlinux_version}")}
+    fi
+
+    # If $COMPOSE_DB_IMAGE is not set, figure out what image to use
+    if [[ -z "${COMPOSE_DB_IMAGE}" ]]; then
+        if [[ "${FORCE_FRESH_SYNC}" == 'true' ]]; then
+            export COMPOSE_DB_IMAGE="docker.io/postgres:9"
+        # If the image/tag exists on DockerHub & $COMPOSE_DB_IMAGE is not set - build new image using DB from existing image
+        elif docker pull "docker.io/nextlinux/engine-db-preload:${nextlinux_version}" &> /dev/null; then
+            export COMPOSE_DB_IMAGE="docker.io/nextlinux/engine-db-preload:${nextlinux_version}"
+        else
+            export COMPOSE_DB_IMAGE="docker.io/nextlinux/engine-db-preload:latest"
+        fi
+    fi
+    if ! docker pull "${COMPOSE_DB_IMAGE}" &> /dev/null && ! docker inspect "${COMPOSE_DB_IMAGE}" &> /dev/null; then
+        export COMPOSE_DB_IMAGE="docker.io/postgres:9"
+    fi
+    echo "COMPOSE_ENGINE_IMAGE=${COMPOSE_ENGINE_IMAGE}"
+    echo "COMPOSE_DB_IMAGE=${COMPOSE_DB_IMAGE}"
+    ##### When running on machine runner in circleci, no need for ssh remote-docker ####
+    mkdir -p "${WORKSPACE}/aevolume/db" "${WORKSPACE}/aevolume/config"
+    cp -f config/config.yaml "${WORKSPACE}/aevolume/config/config.yaml"
+    if [[ "${SLIM_BUILD}" == "true" ]]; then
+        sed -i 's/nvdv2: True/nvdv2: False/g' "${WORKSPACE}/aevolume/config/config.yaml"
+    fi
+    # If CircleCI build, create files/dirs on remote-docker
+    # if [[ "$CI" == true ]]; then
+    #     ssh remote-docker "mkdir -p ${WORKSPACE}/aevolume/db ${WORKSPACE}/aevolume/config"
+    #     scp config/config.yaml remote-docker:"${WORKSPACE}/aevolume/config/config.yaml"
+    #     if [[ "$SLIM_BUILD" == "true" ]]; then
+    #         ssh remote-docker "sed -i 's/nvd: True/nvd: False/g' ${WORKSPACE}/aevolume/config/config.yaml"
+    #     fi
+    # else
+    #     mkdir -p "${WORKSPACE}/aevolume/db" "${WORKSPACE}/aevolume/config"
+    #     cp -f config/config.yaml "${WORKSPACE}/aevolume/config/config.yaml"
+    #     if [[ "${SLIM_BUILD}" == "true" ]]; then
+    #         sed -i 's/nvd: True/nvd: False/g' "${WORKSPACE}/aevolume/config/config.yaml"
+    #     fi
+    # fi
+    docker-compose up -d
+    # If job is running in circleci forward remote-docker:8228 to localhost:8228
+    # if [[ "${CI}" == true ]]; then
+    #     ssh -MS nextlinux -fN4 -L 8228:localhost:8228 remote-docker
+    # fi
+}
+
+install_dependencies() {
+    local build_version="$1"
+    mkdir -p "${WORKSPACE}/aevolume/db" "${WORKSPACE}/aevolume/config"
+    cp -f ${WORKING_DIRECTORY}/config/config.yaml "${WORKSPACE}/aevolume/config/config.yaml"
+    # Install dependencies to system on CircleCI & virtualenv locally
+    if [[ "${CI}" == true ]]; then
+        pip install --upgrade pip
+        pip install --upgrade docker-compose
+        pip install --upgrade "nextlinuxcli==${build_version%.*}" --force-reinstall || pip install --upgrade nextlinuxcli
+    else
+        virtualenv .venv
+        source .venv/bin/activate
+        pip install --upgrade pip
+        pip install --upgrade docker-compose
+        pip install --upgrade "nextlinuxcli==${build_version%.*}" --force-reinstall || pip install --upgrade nextlinuxcli
+    fi
+}
+
+run_tests() {
+    nextlinux-cli --u admin --p foobar --url http://localhost:8228/v1 system wait --feedsready "vulnerabilities"
+    nextlinux-cli --u admin --p foobar --url http://localhost:8228/v1 system status
+    nextlinux-cli --u admin --p foobar --url http://localhost:8228/v1 system feeds list
+    # Don't clone nextlinux-engine if it already exists
+    if [[ ! -d "${WORKSPACE}/nextlinux-engine" ]]; then
+        git clone https://github.com/nextlinux/nextlinux-engine "${WORKSPACE}/nextlinux-engine"
+    fi
+    pushd "${WORKSPACE}/nextlinux-engine/scripts/tests"
+    python aetest.py docker.io/alpine:latest
+    python aefailtest.py docker.io/alpine:latest
+    popd
+}
+
+
+########################################################
+###   COMMON HELPER FUNCTIONS - ALPHABETICAL ORDER   ###
+########################################################
+
+ci_test_job() {
+    local ci_image=$1
+    local ci_function=$2
+    local docker_name="${RANDOM:-TEMP}-ci-test"
+    docker run --net host -it --name "${docker_name}" -v $(dirname "${WORKING_DIRECTORY}"):$(dirname "${WORKING_DIRECTORY}") -v /var/run/docker.sock:/var/run/docker.sock "${ci_image}" /bin/sh -c "\
+        cd ${WORKING_DIRECTORY} && \
+        cp ${WORKING_DIRECTORY}/scripts/build.sh $(dirname "${WORKING_DIRECTORY}")/build.sh && \
+        export WORKING_DIRECTORY=${WORKING_DIRECTORY} && \
+        sudo -E bash $(dirname "${WORKING_DIRECTORY}")/build.sh ${ci_function} \
+    "
+    local docker_id=$(docker inspect ${docker_name} | jq '.[].Id')
+    docker kill "${docker_id}" && docker rm "${docker_id}"
+    DOCKER_RUN_IDS+=("$docker_id")
+}
+
+load_image() {
+    local nextlinux_version="$1"
+    docker load -i "${WORKSPACE}/caches/${IMAGE_REPO##*/}-${nextlinux_version}-dev.tar"
+}
+
+push_dockerhub() {
+    local nextlinux_version="$1"
+    if [[ "${CI}" == true ]]; then
+        echo "${DOCKER_PASS}" | docker login -u "${DOCKER_USER}" --password-stdin
+    fi
+    if [[ "${GIT_BRANCH}" == 'master' || -n "${CIRCLE_TAG}" ]] && [[ "${CI}" == true ]] && [[ ! "${nextlinux_version}" == 'dev' ]]; then
+        docker tag "${IMAGE_REPO}:dev-${nextlinux_version}" "${IMAGE_REPO}:${nextlinux_version}"
+        echo "Pushing to DockerHub - ${IMAGE_REPO}:${nextlinux_version}"
+        docker push "${IMAGE_REPO}:${nextlinux_version}"
+        if [[ "${nextlinux_version}" == "${LATEST_VERSION}" ]]; then
+            docker tag "${IMAGE_REPO}:dev-${nextlinux_version}" "${IMAGE_REPO}:latest"
+            echo "Pushing to DockerHub - ${IMAGE_REPO}:latest"
+            docker push "${IMAGE_REPO}:latest"
+        fi
+    else
+        docker tag "${IMAGE_REPO}:dev-${nextlinux_version}" "nextlinux/private_testing:${IMAGE_REPO##*/}-${nextlinux_version}"
+        echo "Pushing to DockerHub - nextlinux/private_testing:${IMAGE_REPO##*/}-${nextlinux_version}"
+        if [[ "$CI" == 'false' ]]; then
+            sleep 10
+        fi
+        docker push "nextlinux/private_testing:${IMAGE_REPO##*/}-${nextlinux_version}"
+    fi
+}
+
+save_image() {
+    local nextlinux_version="$1"
+    mkdir -p "${WORKSPACE}/caches"
+    docker save -o "${WORKSPACE}/caches/${IMAGE_REPO##*/}-${nextlinux_version}-dev.tar" "${IMAGE_REPO}:dev-${nextlinux_version}"
+}
+
+setup_and_print_env_vars() {
+    # Export & print all project env vars to the screen
+    echo "${color_yellow}"
+    printf "%s\n\n" "- ENVIRONMENT VARIABLES SET -"
+    echo "BUILD_VERSIONS=${BUILD_VERSIONS[@]}"
+    printf "%s\n" "LATEST_VERSION=${LATEST_VERSION}"
+    for var in ${PROJECT_VARS[@]}; do
+        export "${var}"
+        printf "%s" "${color_yellow}"
+        printf "%s\n" "${var}"
+    done
+    echo "${color_normal}"
+    # If running tests manually, sleep for a few seconds to give time to visually double check that ENV is setup correctly
+    if [[ "${CI}" == false ]]; then
+        sleep 5
+    fi
+    # Setup a variable for docker image cleanup at end of script
+    declare -a DOCKER_RUN_IDS
+    export DOCKER_RUN_IDS
+}
+
+setup_build_environment() {
+    local build_version="$1"
+    # Copy source code to $WORKING_DIRECTORY for mounting to docker volume as working dir
+    if [[ ! -d "${WORKING_DIRECTORY}" ]]; then
+        mkdir -p "${WORKING_DIRECTORY}"
+        cp -a . "${WORKING_DIRECTORY}"
+    fi
+    # Setup python3 for machine runner
+    if [[ "${CI}" == true ]]; then
+        if [[ ! $(pyenv versions) =~ 3.6.3 ]]; then
+            pyenv install 3.6.3
+        fi
+        pyenv global 3.6.3
+    fi
+    mkdir -p "${WORKSPACE}/caches"
+    pushd "${WORKING_DIRECTORY}"
+    install_dependencies "${build_version}" || true
+}
+
+main "$@"
