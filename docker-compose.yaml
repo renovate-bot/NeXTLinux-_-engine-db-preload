@@ -1,0 +1,30 @@
+# Nextlinux engine docker-compose configuration.
+version: '2'
+services:
+  nextlinux-engine:
+    image: ${COMPOSE_ENGINE_IMAGE}
+    container_name: nextlinux-engine
+    depends_on:
+     - nextlinux-db
+    ports:
+     - "8228:8228"
+    volumes:
+     - ${WORKSPACE}/aevolume/config:/config/:z
+    environment:
+     - NEXTLINUX_HOST_ID=nextlinux-engine
+    logging:
+     driver: "json-file"
+     options:
+      max-size: 100m
+  nextlinux-db:
+    image: ${COMPOSE_DB_IMAGE}
+    container_name: nextlinux-db
+    volumes:
+     - ${WORKSPACE}/aevolume/db:/var/lib/postgresql/data/pgdata/:z
+    environment:
+      - POSTGRES_PASSWORD=mysecretpassword
+      - PGDATA=/var/lib/postgresql/data/pgdata/
+    logging:
+     driver: "json-file"
+     options:
+      max-size: 100m
