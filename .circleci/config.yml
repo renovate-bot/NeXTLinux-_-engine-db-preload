@@ -1,0 +1,151 @@
+# CircleCI 2.0 configuration file
+#
+# Check https://circleci.com/docs/2.0/configuration-reference/ for more details
+#
+# The following environment variables must be set in the circleci project UI
+#   - $IMAGE_NAME = nextlinux/engine-db-preload
+#
+# Define YAML anchors
+.filter_semver_tags: &filter_semver_tags
+  branches:
+    ignore: /.*/
+  tags:
+    only: /^v[0-9]+(\.[0-9]+)*$/
+
+parameters:
+  force_trigger_nightly_build:
+    type: boolean
+    default: false
+
+# Start circleci configuration
+version: 2.1
+jobs:
+  build_test_push_preload_image:
+    parameters:
+      nextlinux_version: 
+        default: ""
+        type: string
+    machine:
+      image: ubuntu-2004:202201-02
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Setup Nextlinux Engine, Sync Feeds & Build Image
+          command: scripts/build.sh build << parameters.nextlinux_version >>
+          no_output_timeout: 1h
+      - run:
+          name: Save image to workspace
+          command: scripts/build.sh save_images << parameters.nextlinux_version >>
+          no_output_timeout: 1h
+      - run:
+          name: Docker Compose & Run Tests
+          command: scripts/build.sh test_built_images << parameters.nextlinux_version >>
+          no_output_timeout: 1h
+      - run:
+          name: Push to DockerHub
+          command: scripts/build.sh push_all_versions << parameters.nextlinux_version >>
+          no_output_timeout: 1h
+
+  build_test_push_slim_preload_image:
+    parameters:
+      nextlinux_version: 
+        default: ""
+        type: string
+    machine:
+      image: ubuntu-2004:202201-02
+    resource_class: large
+    environment:
+      IMAGE_REPO: docker.io/nextlinux/engine-db-preload-slim
+    steps:
+      - checkout
+      - run:
+          name: Setup Nextlinux Engine, Sync Feeds & Build Image
+          command: scripts/build.sh -s build << parameters.nextlinux_version >>
+          no_output_timeout: 1h
+      - run:
+          name: Save image to workspace
+          command: scripts/build.sh -s save_images << parameters.nextlinux_version >>
+          no_output_timeout: 1h
+      - run:
+          name: Docker Compose & Run Tests
+          command: scripts/build.sh -s test_built_images << parameters.nextlinux_version >>
+          no_output_timeout: 1h
+      - run:
+          name: Push to DockerHub
+          command: scripts/build.sh -s push_all_versions << parameters.nextlinux_version >>
+          no_output_timeout: 1h
+
+workflows:
+  default_workflow:
+    when:
+      not:
+        equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+
+    jobs:
+      - build_test_push_slim_preload_image:
+          name: build_test_push_slim_preload_image_dev
+          nextlinux_version: dev
+          context: dockerhub
+      - build_test_push_preload_image:
+          name: build_test_push_preload_image_dev
+          nextlinux_version: dev
+          context: dockerhub
+
+  tagged_build_all:
+    when:
+      not:
+        equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+
+    jobs:
+      - build_test_push_slim_preload_image:
+          name: build_test_push_slim_preload_image_all
+          nextlinux_version: all
+          context: dockerhub
+          filters: *filter_semver_tags
+      - build_test_push_preload_image:
+          name: build_test_push_preload_image_all
+          nextlinux_version: all
+          context: dockerhub
+          filters: *filter_semver_tags
+
+  nightly_build:
+    when:
+      or:
+        - and:
+            - equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+            - equal: [ "nightly_build", << pipeline.schedule.name >> ]
+        - << pipeline.parameters.force_trigger_nightly_build >>
+    jobs:
+      - build_test_push_slim_preload_image:
+          name: build_test_push_slim_preload_image_v094
+          nextlinux_version: v0.9.4
+          context: dockerhub
+      - build_test_push_slim_preload_image:
+          name: build_test_push_slim_preload_image_v0100
+          nextlinux_version: v0.10.0
+          context: dockerhub
+      - build_test_push_slim_preload_image:
+          name: build_test_push_slim_preload_image_v0101
+          nextlinux_version: v0.10.1
+          context: dockerhub
+      - build_test_push_slim_preload_image:
+          name: build_test_push_slim_preload_image_v0102
+          nextlinux_version: v0.10.2
+          context: dockerhub
+      - build_test_push_preload_image:
+          name: build_test_push_preload_image_v094
+          nextlinux_version: v0.9.4
+          context: dockerhub
+      - build_test_push_preload_image:
+          name: build_test_push_preload_image_v0100
+          nextlinux_version: v0.10.0
+          context: dockerhub
+      - build_test_push_preload_image:
+          name: build_test_push_preload_image_v0101
+          nextlinux_version: v0.10.1
+          context: dockerhub
+      - build_test_push_preload_image:
+          name: build_test_push_preload_image_v0102
+          nextlinux_version: v0.10.2
+          context: dockerhub
